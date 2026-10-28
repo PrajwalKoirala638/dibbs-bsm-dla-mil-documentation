@@ -24,7 +24,8 @@ ZIP_DIR = ROOT_DIR / "zips"  # Store downloaded ZIP archives here.
 EXTRACT_DIR = ROOT_DIR / "extracted"  # Extract each ZIP into its own folder here.
 TIMEOUT_MS = 20000  # Standard browser operation timeout in milliseconds.
 DOWNLOAD_TIMEOUT_MS = 180000  # Allow large archives three minutes (60 s could cut them off).
-MAX_DOWNLOAD_ATTEMPTS = 3  # Try each download at most this many times.
+MAX_DOWNLOAD_ATTEMPTS = 3  # Try each plain HTTP download at most this many times.
+BROWSER_DOWNLOAD_TIMEOUT_S = 60  # Seconds to wait for the browser to start a download.
 ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")  # Valid first bytes of a ZIP file.
 ALWAYS_REFRESH = {"bqothers.zip"}  # Archives DIBBS rewrites under the same name, so they are downloaded on every run.
 
@@ -156,22 +157,9 @@ async def acknowledge_warning(page) -> bool:  # Find and click the warning page'
     return False  # Indicate that no OK control was clicked.
 
 
-async def accept_warning_on_host(page, archive_url: str) -> bool:  # Accept the warning on the host that serves the archive.
-    logger.info("Opening %s in the browser to accept that host's warning page.", archive_url)  # Explain why the browser navigates.
-    try:  # Navigating straight to a ZIP can start a download instead of loading a page.
-        await page.goto(archive_url, wait_until="domcontentloaded", timeout=60000)  # Visit the archive URL so the host sets its cookies.
-    except PlaywrightError as exc:  # Catch the "download is starting" error and navigation failures.
-        logger.info("Browser navigation to the archive ended early (%s); assuming the host accepted us.", exc)  # Report the early end.
-        return True  # A started download means no warning page blocked us.
-    if "dodwarning.aspx" in page.url.lower():  # Detect the warning page on this host.
-        return await acknowledge_warning(page)  # Click OK so the host stores its consent cookie.
-    return True  # No warning page appeared, so nothing else is needed.
-
-
-async def download_zip_bytes(context, page, archive_url: str, consented_hosts: Set[str]) -> Optional[bytes]:  # Download one archive and return its bytes only if they are a ZIP.
-    host = (urlparse(archive_url).hostname or "").lower()  # Identify which host serves this archive.
+async def download_zip_bytes(context, archive_url: str) -> Optional[bytes]:  # Try a plain HTTP download and return the bytes only if they are a ZIP.
     attempt = 0  # Count download attempts.
-    while attempt < MAX_DOWNLOAD_ATTEMPTS:  # Retry a limited number of times.
+    while attempt < MAX_DOWNLOAD_ATTEMPTS:  # Retry transient failures a limited number of times.
         attempt += 1  # Record this attempt.
         try:  # Handle network errors and timeouts for this attempt.
             response = await context.request.get(archive_url, timeout=DOWNLOAD_TIMEOUT_MS)  # Download using the browser context's cookies.
@@ -192,37 +180,76 @@ async def download_zip_bytes(context, page, archive_url: str, consented_hosts: S
             len(payload),  # Size of the response body.
             payload[:60],  # First bytes of the body, to recognize an HTML page.
         )  # Finish the diagnostic message.
-        body_start = payload[:20000].lower()  # Lowercase the start of the body to search it for banner markers.
-        warning_page = "dodwarning" in response.url.lower() or b"dodwarning" in body_start or b"butagree" in body_start or b"notice and consent banner" in body_start  # Detect the banner by URL or content.
-        if warning_page and host not in consented_hosts:  # The host wants its warning acknowledged first.
-            consented_hosts.add(host)  # Handle each host's warning only once.
-            await accept_warning_on_host(page, archive_url)  # Click OK in the visible browser, then retry.
-        elif response.status >= 500:  # A server-side error might be temporary.
+        if response.status >= 500:  # A server-side error might be temporary.
             await asyncio.sleep(2 * attempt)  # Wait longer after each failed attempt.
-        else:  # Anything else (404, repeated warning page, error page) will not fix itself.
-            break  # Stop retrying.
-    return None  # Report that no valid ZIP could be downloaded.
+        else:  # A warning banner, 404, or other answer will not change by retrying.
+            break  # Stop retrying and let the caller try the browser instead.
+    return None  # Report that plain HTTP could not fetch a valid ZIP.
 
 
-async def download_to_disk(context, page, archive_url: str, zip_path: Path, stats: RunStats, consented_hosts: Set[str]) -> bool:  # Download a ZIP, validate it, and save it safely.
-    payload = await download_zip_bytes(context, page, archive_url, consented_hosts)  # Fetch the archive bytes.
-    if payload is None:  # Detect a failed download.
-        return False  # Nothing was saved.
-    size = len(payload)  # Remember the size before the bytes are released.
+async def browser_download(page, archive_url: str, target: Path) -> bool:  # Download one archive through the visible browser, accepting the warning banner if it appears.
+    loop = asyncio.get_running_loop()  # Get the running event loop so a future can be created on it.
+    download_future = loop.create_future()  # Resolve this future when the browser starts a download.
+
+    def on_download(download) -> None:  # Receive the browser's download event.
+        if not download_future.done():  # Ignore any download after the first one.
+            download_future.set_result(download)  # Hand the download object to the waiting code.
+
+    page.on("download", on_download)  # Start listening before navigating so no event is missed.
+    try:  # Make sure the listener is always removed.
+        try:  # Navigate like a person clicking the link on the RFQ page.
+            await page.goto(archive_url, referer=START_URL, wait_until="domcontentloaded", timeout=60000)  # Open the archive URL with the RFQ page as referer.
+            page_loaded = True  # A normal page loaded, so the browser did not start a download.
+        except PlaywrightError as exc:  # Chromium reports a starting download as a navigation error.
+            if "download is starting" not in str(exc).lower():  # Re-raise genuine navigation failures.
+                raise  # Let the caller log the real error.
+            page_loaded = False  # The download is starting, so no banner is in the way.
+        if page_loaded:  # A page loaded instead of a download, probably the warning banner.
+            button = page.locator("#butAgree")  # Find the banner's OK button.
+            if await button.count() == 0:  # Detect a page that is not the banner.
+                logger.error("The browser got a page instead of a ZIP: %s | title: %s", page.url, await page.title())  # Report what loaded.
+                return False  # Give up on this archive.
+            form_action = await page.locator("form").first.get_attribute("action")  # Read where the banner's form posts to.
+            logger.info("Warning banner shown at %s (form action: %s); clicking OK.", page.url, form_action)  # Log the details for troubleshooting.
+            await button.first.click(timeout=5000, no_wait_after=True)  # Click OK and let the redirect to the ZIP run.
+        download = await asyncio.wait_for(download_future, timeout=BROWSER_DOWNLOAD_TIMEOUT_S)  # Wait for the browser to start the download.
+        await download.save_as(target)  # Save the finished download to the target path.
+        return True  # Report success.
+    except asyncio.TimeoutError:  # No download started in time.
+        logger.error("The browser never started a download for %s (page: %s | title: %s)", archive_url, page.url, await page.title())  # Report the stuck page.
+        return False  # Report failure.
+    finally:  # Always clean up the listener.
+        page.remove_listener("download", on_download)  # Stop listening for downloads.
+
+
+async def download_to_disk(context, page, archive_url: str, zip_path: Path, stats: RunStats, browser_hosts: Set[str]) -> bool:  # Download a ZIP, validate it, and save it safely.
+    host = (urlparse(archive_url).hostname or "").lower()  # Identify which host serves this archive.
     temp_path = zip_path.with_name(zip_path.name + ".part")  # Write to a temporary name so a crash cannot leave a half-written ZIP.
-    temp_path.write_bytes(payload)  # Save the downloaded bytes to the temporary file.
-    del payload  # Release the large byte string now that it is on disk.
-    if not zipfile.is_zipfile(temp_path):  # Double-check that the saved file really is a ZIP archive.
-        logger.error("Downloaded file is not a valid ZIP archive: %s", archive_url)  # Report the invalid archive.
-        temp_path.unlink(missing_ok=True)  # Delete the unusable file instead of leaving it behind.
+    temp_path.unlink(missing_ok=True)  # Remove any leftover temporary file from an earlier run.
+    saved = False  # Track whether some method produced a file.
+    if host not in browser_hosts:  # Try the fast plain HTTP download first on hosts where it works.
+        payload = await download_zip_bytes(context, archive_url)  # Fetch the archive bytes over HTTP.
+        if payload is not None:  # Detect a successful HTTP download.
+            temp_path.write_bytes(payload)  # Save the downloaded bytes to the temporary file.
+            del payload  # Release the large byte string now that it is on disk.
+            saved = True  # Remember that the file exists.
+        else:  # Plain HTTP did not return a ZIP.
+            logger.info("Plain HTTP download failed; using the browser for every archive on %s.", host)  # Explain the switch.
+            browser_hosts.add(host)  # Use the browser for this host from now on.
+    if not saved:  # Fall back to the browser, which behaves like a person clicking the link.
+        saved = await browser_download(page, archive_url, temp_path)  # Download through the visible browser.
+    if not saved or not zipfile.is_zipfile(temp_path):  # Reject a missing or non-ZIP result.
+        logger.error("No valid ZIP could be saved for %s", archive_url)  # Report the failure.
+        temp_path.unlink(missing_ok=True)  # Delete the unusable file.
         return False  # Report the failed download.
+    size = temp_path.stat().st_size  # Read the final file size for the log.
     temp_path.replace(zip_path)  # Move the finished file onto its final name in one step.
     stats.downloaded += 1  # Count this successful download.
     logger.info("Saved %s (%d bytes)", zip_path, size)  # Report the saved file size.
     return True  # Report a successful download.
 
 
-async def process_archive(context, page, archive_url: str, stats: RunStats, consented_hosts: Set[str]) -> None:  # Download (if needed) and extract one archive.
+async def process_archive(context, page, archive_url: str, stats: RunStats, browser_hosts: Set[str]) -> None:  # Download (if needed) and extract one archive.
     filename = safe_filename(archive_url)  # Convert the URL filename into a safe local filename.
     zip_path = ZIP_DIR / filename  # Build the local destination path for the ZIP file.
     assert zip_path.parent == ZIP_DIR, f"Unsafe ZIP filename: {filename}"  # Guarantee the ZIP cannot land outside ZIP_DIR.
@@ -238,7 +265,7 @@ async def process_archive(context, page, archive_url: str, stats: RunStats, cons
     cached = not refresh and zip_path.exists() and zipfile.is_zipfile(zip_path)  # Reuse a local ZIP only for archives that never change.
     if cached:  # A local copy exists.
         logger.info("A local ZIP already exists; trying it before downloading again: %s", zip_path)  # Report reuse.
-    elif not await download_to_disk(context, page, archive_url, zip_path, stats, consented_hosts):  # Download when no usable copy exists.
+    elif not await download_to_disk(context, page, archive_url, zip_path, stats, browser_hosts):  # Download when no usable copy exists.
         raise RuntimeError(f"Download failed for {archive_url}")  # Report the failed download to the caller.
     if extract_archive(zip_path, destination):  # Validate and extract the archive contents.
         stats.extracted += 1  # Count a successful extraction.
@@ -246,7 +273,7 @@ async def process_archive(context, page, archive_url: str, stats: RunStats, cons
     zip_path.unlink(missing_ok=True)  # Delete the ZIP that would not extract so it is never reused.
     if cached:  # The old local copy may have been the problem, so try one fresh download.
         logger.warning("The local ZIP would not extract; downloading a fresh copy: %s", archive_url)  # Report the retry.
-        if await download_to_disk(context, page, archive_url, zip_path, stats, consented_hosts) and extract_archive(zip_path, destination):  # Download again and extract.
+        if await download_to_disk(context, page, archive_url, zip_path, stats, browser_hosts) and extract_archive(zip_path, destination):  # Download again and extract.
             stats.extracted += 1  # Count a successful extraction.
             return  # This archive is finished.
         zip_path.unlink(missing_ok=True)  # Delete the fresh copy too if it also failed.
@@ -257,7 +284,7 @@ async def main() -> None:  # Run the browser workflow, download archives, and ex
     ZIP_DIR.mkdir(parents=True, exist_ok=True)  # Create the archive download folder.
     EXTRACT_DIR.mkdir(parents=True, exist_ok=True)  # Create the extraction root folder.
     stats = RunStats()  # Create the counters for this run.
-    consented_hosts: Set[str] = set()  # Remember hosts whose warning page was already handled.
+    browser_hosts: Set[str] = set()  # Remember hosts where plain HTTP downloads are blocked, so the browser is used.
     failed_requests = 0  # Count failed browser network requests.
     async with async_playwright() as playwright:  # Start Playwright and manage its resources.
         browser = await playwright.chromium.launch(headless=False)  # Launch Chromium visibly rather than headless.
@@ -317,7 +344,7 @@ async def main() -> None:  # Run the browser workflow, download archives, and ex
                 logger.info("Current page URL: %s", page.url)  # Log the current URL for troubleshooting.
             for archive_url in archive_urls:  # Download and extract each matching archive.
                 try:  # Handle errors for each archive independently.
-                    await process_archive(context, page, archive_url, stats, consented_hosts)  # Download, validate, and extract this archive.
+                    await process_archive(context, page, archive_url, stats, browser_hosts)  # Download, validate, and extract this archive.
                 except Exception as exc:  # Keep one failed archive from stopping the remaining ones.
                     stats.failed += 1  # Count the failed archive.
                     logger.exception("Failed to process archive %s: %s", archive_url, exc)  # Log the complete exception details.
