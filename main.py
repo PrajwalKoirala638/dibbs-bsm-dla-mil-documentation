@@ -25,7 +25,7 @@ ALLOWED_HOSTS = {  # Limit downloads to official DIBBS hosts.
     "dibbs.bsm.dla.mil",  # Bare DIBBS domain.
 }  # End of the allowed-host set.
 ARCHIVE_PATH_MARKER = "/Downloads/RFQ/Archive/"  # Official RFQ archive download path.
-ZIP_DIR = "zips"  # Store downloaded ZIP archives here (they stay zipped).
+ZIP_DIR = Path("zip")  # Store downloaded ZIP archives here (they stay zipped).
 TIMEOUT_MS = 20000  # Standard browser operation timeout in milliseconds.
 DOWNLOAD_TIMEOUT_MS = 180000  # Allow large archives three minutes.
 MAX_DOWNLOAD_ATTEMPTS = 3  # Try each plain HTTP download at most this many times.
