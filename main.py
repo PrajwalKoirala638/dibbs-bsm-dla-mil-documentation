@@ -2,16 +2,12 @@
 # IMPORTS  # Standard library first, then Playwright.
 # =====================================================================  # End of the section banner.
 import asyncio  # Provide asynchronous execution for Playwright.
-import hashlib  # Compare two files by content using a SHA-256 hash.
 import logging  # Record progress, warnings, and errors in the console.
-import re  # Clean remote filenames with a regular expression.
+import re  # Clean URL filenames with a regular expression.
 import zipfile  # Only used to confirm a downloaded file is a ZIP (nothing is extracted).
 from dataclasses import dataclass  # Build the small counter class without boilerplate.
-from email.message import (
-    Message,
-)  # Parse the Content-Disposition header, including encoded filenames.
 from pathlib import Path  # Work with local filesystem paths.
-from typing import List, Optional, Set  # Annotate lists, optional values, and sets.
+from typing import List, Set  # Annotate lists and sets.
 from urllib.parse import unquote, urlparse  # Safely interpret URL paths and hostnames.
 from playwright.async_api import (  # Control visible Chromium and handle browser errors.
     Error as PlaywrightError,  # Base class of every Playwright error, timeouts included.
@@ -31,9 +27,6 @@ ALLOWED_HOSTS = {  # Limit downloads to official DIBBS hosts.
 ARCHIVE_PATH_MARKER = "/Downloads/RFQ/Archive/"  # Official RFQ archive download path.
 ROOT_DIR = Path("dibbs_data")  # Store all downloaded data in this folder.
 ZIP_DIR = ROOT_DIR / "zips"  # Store downloaded ZIP archives here (they stay zipped).
-TEMP_NAME = (
-    "incoming.part"  # Neutral temporary name used until the remote filename is known.
-)
 TIMEOUT_MS = 20000  # Standard browser operation timeout in milliseconds.
 DOWNLOAD_TIMEOUT_MS = 180000  # Allow large archives three minutes.
 MAX_DOWNLOAD_ATTEMPTS = 3  # Try each plain HTTP download at most this many times.
@@ -62,46 +55,27 @@ logger = logging.getLogger(
 # =====================================================================  # End of the section banner.
 @dataclass  # Generate the constructor automatically.
 class RunStats:  # Hold the counters that appear in the run summary.
-    downloaded: int = 0  # New or changed ZIP files saved during this run.
-    unchanged: int = (
-        0  # Downloads identical to a ZIP already on disk, so nothing was replaced.
-    )
+    downloaded: int = 0  # New ZIP files saved during this run.
+    skipped: int = 0  # ZIP files that were already on disk and valid.
     failed: int = 0  # Archives that could not be downloaded.
     failed_requests: int = 0  # Failed browser network requests.
 
 
-# =====================================================================  # Section: URL and filename helpers.
-# URL AND FILENAME HELPERS  # Pure functions with no browser or disk work.
+# =====================================================================  # Section: URL helpers.
+# URL HELPERS  # Pure functions with no browser or disk work.
 # =====================================================================  # End of the section banner.
-def clean_filename(
-    raw_name: str,
-) -> str:  # Make a remote filename safe to use on the local disk.
-    base_name = Path(
-        unquote(raw_name).replace("\\", "/")
-    ).name  # Drop any folder parts a server might include.
+def filename_from_url(
+    url: str,
+) -> str:  # Extract the archive filename from its URL, e.g. bq261001.zip.
+    raw_name = unquote(
+        Path(urlparse(url).path).name
+    )  # Take the last part of the URL path and URL-decode it.
     cleaned_name = re.sub(
-        r"[^A-Za-z0-9._-]", "_", base_name
+        r"[^A-Za-z0-9._-]", "_", raw_name
     )  # Replace unsafe characters with underscores.
     return (
         cleaned_name.strip(".") or "download.zip"
     )  # Never return an empty or dot-only name.
-
-
-def remote_filename(
-    content_disposition: Optional[str], url: str
-) -> str:  # Work out the filename the server itself gives this archive.
-    name = ""  # Start with no name.
-    if content_disposition:  # Prefer the name the server announces for the download.
-        header = Message()  # Create a container that understands header parameters.
-        header["Content-Disposition"] = (
-            content_disposition  # Store the raw header value.
-        )
-        name = (
-            header.get_filename() or ""
-        )  # Read filename or filename* (decoded) from the header.
-    if not name:  # The server announced no name, so use the last part of the URL.
-        name = Path(urlparse(url).path).name  # Take the filename from the URL path.
-    return clean_filename(name)  # Return the cleaned remote name.
 
 
 def is_allowed_archive_url(
@@ -118,43 +92,6 @@ def is_allowed_archive_url(
     return (
         parsed.scheme == "https" and host_allowed and path_allowed and zip_allowed
     )  # Accept only if every check passes.
-
-
-# =====================================================================  # Section: file helpers.
-# FILE HELPERS  # Small disk operations.
-# =====================================================================  # End of the section banner.
-def file_sha256(
-    path: Path,
-) -> str:  # Hash a file in chunks so large archives never fill memory.
-    digest = hashlib.sha256()  # Create the hash object.
-    with path.open("rb") as handle:  # Open the file for binary reading.
-        for chunk in iter(
-            lambda: handle.read(1024 * 1024), b""
-        ):  # Read one megabyte at a time until the file ends.
-            digest.update(chunk)  # Feed the chunk into the hash.
-    return digest.hexdigest()  # Return the hash as text.
-
-
-def store_download(
-    temp_path: Path, remote_name: str, stats: RunStats
-) -> None:  # Move a finished download to its remote filename.
-    final_path = ZIP_DIR / remote_name  # Build the final path from the remote filename.
-    assert (
-        final_path.parent == ZIP_DIR
-    ), f"Unsafe ZIP filename: {remote_name}"  # Guarantee the file cannot land outside ZIP_DIR.
-    if final_path.is_file() and file_sha256(final_path) == file_sha256(
-        temp_path
-    ):  # Detect an identical copy already on disk.
-        temp_path.unlink(missing_ok=True)  # Discard the duplicate download.
-        stats.unchanged += 1  # Count the unchanged archive.
-        logger.info(
-            "%s is unchanged; keeping the existing file.", remote_name
-        )  # Report the decision.
-        return  # Nothing more to do.
-    size = temp_path.stat().st_size  # Read the final file size for the log.
-    temp_path.replace(final_path)  # Move the file onto its final name in one step.
-    stats.downloaded += 1  # Count this saved download.
-    logger.info("Saved %s (%d bytes)", final_path, size)  # Report the saved file.
 
 
 # =====================================================================  # Section: warning banner and page handling.
@@ -389,11 +326,11 @@ def attach_page_listeners(
 
 
 # =====================================================================  # Section: downloading.
-# DOWNLOADING  # Two ways to fetch an archive; both return the remote filename.
+# DOWNLOADING  # Two ways to fetch an archive, then the per-archive workflow.
 # =====================================================================  # End of the section banner.
 async def fetch_via_http(
     context, archive_url: str, temp_path: Path
-) -> Optional[str]:  # Plain HTTP download that returns the remote filename on success.
+) -> bool:  # Plain HTTP download that reports whether a valid ZIP was saved.
     attempt = 0  # Count download attempts.
     while (
         attempt < MAX_DOWNLOAD_ATTEMPTS
@@ -420,9 +357,7 @@ async def fetch_via_http(
             temp_path.write_bytes(
                 payload
             )  # Save the verified ZIP bytes to the temporary file.
-            return remote_filename(
-                response.headers.get("content-disposition"), response.url
-            )  # Return the name the server gave (final URL after redirects).
+            return True  # Report success.
         logger.warning(  # Explain exactly what came back instead of a ZIP.
             "Attempt %d/%d did not return a ZIP: HTTP %s, final URL %s, content-type %s, %d bytes, starts with %r",  # Message template.
             attempt,  # Current attempt number.
@@ -439,12 +374,12 @@ async def fetch_via_http(
             await asyncio.sleep(2 * attempt)  # Wait longer after each failed attempt.
         else:  # A warning banner, 404, or other answer will not change by retrying.
             break  # Stop retrying and let the caller try the browser instead.
-    return None  # Report that plain HTTP could not fetch a valid ZIP.
+    return False  # Report that plain HTTP could not fetch a valid ZIP.
 
 
 async def fetch_via_browser(
     page, archive_url: str, temp_path: Path
-) -> Optional[str]:  # Browser download that returns the remote filename on success.
+) -> bool:  # Browser download that reports whether a file was saved.
     loop = (
         asyncio.get_running_loop()
     )  # Get the running event loop so a future can be created on it.
@@ -490,7 +425,7 @@ async def fetch_via_browser(
                     page.url,
                     await page.title(),
                 )  # Report what loaded.
-                return None  # Give up on this archive.
+                return False  # Give up on this archive.
             form_action = await page.locator("form").first.get_attribute(
                 "action"
             )  # Read where the banner's form posts to.
@@ -508,9 +443,7 @@ async def fetch_via_browser(
         await download.save_as(
             temp_path
         )  # Save the finished download to the temporary path.
-        return clean_filename(
-            download.suggested_filename
-        )  # Return the filename the browser took from the server.
+        return True  # Report success.
     except asyncio.TimeoutError:  # No download started in time.
         logger.error(
             "The browser never started a download for %s (page: %s | title: %s)",
@@ -518,60 +451,74 @@ async def fetch_via_browser(
             page.url,
             await page.title(),
         )  # Report the stuck page.
-        return None  # Report failure.
+        return False  # Report failure.
     finally:  # Always clean up the listener.
         page.remove_listener("download", on_download)  # Stop listening for downloads.
 
 
 async def download_archive(
     context, page, archive_url: str, stats: RunStats, browser_hosts: Set[str]
-) -> None:  # Download one archive and save it under its remote filename.
+) -> None:  # Download one archive and save it under the filename from its URL.
     logger.info(
         "Processing archive URL: %s", archive_url
     )  # Report which archive is being processed.
-    host = (
-        urlparse(archive_url).hostname or ""
-    ).lower()  # Identify which host serves this archive.
-    temp_path = (
-        ZIP_DIR / TEMP_NAME
-    )  # Write to a neutral temporary name until the remote name is known.
+    filename = filename_from_url(
+        archive_url
+    )  # Extract the filename from the URL, e.g. bq261001.zip.
+    zip_path = ZIP_DIR / filename  # Build the final local path from that filename.
+    assert (
+        zip_path.parent == ZIP_DIR
+    ), f"Unsafe ZIP filename: {filename}"  # Guarantee the ZIP cannot land outside ZIP_DIR.
+    temp_path = zip_path.with_name(
+        zip_path.name + ".part"
+    )  # Write to a ".part" copy so a crash cannot leave a half-written ZIP.
+    logger.info(
+        "Local filename from URL: %s", filename
+    )  # Report the extracted filename.
+    if zip_path.is_file() and zipfile.is_zipfile(
+        zip_path
+    ):  # Detect an archive that is already downloaded and valid.
+        logger.info("%s is already downloaded; skipping.", filename)  # Report the skip.
+        stats.skipped += 1  # Count the skipped archive.
+        return  # Nothing more to do for this archive.
     temp_path.unlink(
         missing_ok=True
     )  # Remove any leftover temporary file from an earlier run.
-    remote_name: Optional[str] = (
-        None  # Holds the remote filename once some method succeeds.
-    )
+    saved = False  # Track whether some method produced a file.
+    host = (
+        urlparse(archive_url).hostname or ""
+    ).lower()  # Identify which host serves this archive.
     if (
         host not in browser_hosts
     ):  # Try the fast plain HTTP download first on hosts where it works.
-        remote_name = await fetch_via_http(
+        saved = await fetch_via_http(
             context, archive_url, temp_path
-        )  # Fetch over HTTP and read the remote filename.
-        if remote_name is None:  # Plain HTTP did not return a ZIP.
+        )  # Fetch the archive over HTTP.
+        if not saved:  # Plain HTTP did not return a ZIP.
             logger.info(
                 "Plain HTTP download failed; using the browser for every archive on %s.",
                 host,
             )  # Explain the switch.
             browser_hosts.add(host)  # Use the browser for this host from now on.
     if (
-        remote_name is None
+        not saved
     ):  # Fall back to the browser, which behaves like a person clicking the link.
-        remote_name = await fetch_via_browser(
+        saved = await fetch_via_browser(
             page, archive_url, temp_path
         )  # Download through the visible browser.
-    if remote_name is None or not zipfile.is_zipfile(
+    if not saved or not zipfile.is_zipfile(
         temp_path
     ):  # Reject a missing or non-ZIP result.
         temp_path.unlink(missing_ok=True)  # Delete the unusable file.
         raise RuntimeError(
             f"No valid ZIP could be saved for {archive_url}"
         )  # Report the failed download to the caller.
-    logger.info(
-        "Remote filename for %s is %s", archive_url, remote_name
-    )  # Record the name the server gave.
-    store_download(
-        temp_path, remote_name, stats
-    )  # Move the file to its remote filename (or discard an identical copy).
+    size = temp_path.stat().st_size  # Read the final file size for the log.
+    temp_path.replace(
+        zip_path
+    )  # Move the finished file onto its final name in one step.
+    stats.downloaded += 1  # Count this saved download.
+    logger.info("Saved %s (%d bytes)", zip_path, size)  # Report the saved file.
 
 
 async def run_downloads(
@@ -597,11 +544,11 @@ async def run_downloads(
 def log_summary(stats: RunStats) -> None:  # Print the end-of-run summary.
     logger.info("========== RUN SUMMARY ==========")  # Mark the start of the summary.
     logger.info(
-        "New or changed ZIP downloads: %d", stats.downloaded
+        "New ZIP downloads: %d", stats.downloaded
     )  # Report the number of saved downloads.
     logger.info(
-        "Unchanged (already on disk): %d", stats.unchanged
-    )  # Report downloads identical to existing files.
+        "Already downloaded (skipped): %d", stats.skipped
+    )  # Report archives that needed no work.
     logger.info("Failures: %d", stats.failed)  # Report the number of failures.
     logger.info(
         "Failed browser requests: %d", stats.failed_requests
@@ -641,7 +588,7 @@ async def main() -> None:  # Run the browser workflow and download the archives.
             )  # Read the official ZIP links from the page.
             await run_downloads(
                 context, page, archive_urls, stats
-            )  # Download every archive under its remote filename.
+            )  # Download every archive under its URL filename.
             log_summary(stats)  # Print the run summary.
             logger.info(
                 "Chromium will remain open for 30 seconds before closing."
